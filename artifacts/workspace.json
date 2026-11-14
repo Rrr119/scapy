@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid17885",
+  "B": "/home/dev/feedback/uid17885",
+  "sha": "0e2f6ba2669dc9c6487d7c0a4220b3c3dfd6d4ef",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "secdev",
+    "repo": "scapy",
+    "sha": "0e2f6ba2669dc9c6487d7c0a4220b3c3dfd6d4ef"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "scapy",
+    "cloneUrl": "https://github.com/Rrr119/scapy.git"
+  },
+  "at": "2026-11-14T08:39:55.153Z"
+}

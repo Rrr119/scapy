@@ -194,3 +194,344 @@ p.show()
 assert p.topic == b""
 assert p.value == b""
 assert p.msgid is None
+
+
++ MQTT 5.0 variable byte integer
+
+= VarIntField encoding and decoding
+varint = VarIntField("x", 0)
+for value, expected in [
+    (0, b"\x00"),
+    (127, b"\x7f"),
+    (128, b"\x80\x01"),
+    (16383, b"\xff\x7f"),
+    (16384, b"\x80\x80\x01"),
+    (2097151, b"\xff\xff\x7f"),
+    (268435455, b"\xff\xff\xff\x7f"),
+]:
+    encoded = varint.addfield(None, b"", value)
+    assert encoded == expected
+    remain, decoded = varint.getfield(None, encoded + b"ZZ")
+    assert decoded == value
+    assert remain == b"ZZ"
+
+= VarIntField rejects a malformed integer
+try:
+    VarIntField("x", 0).getfield(None, b"\x80\x80\x80\x80\x80")
+except Scapy_Exception:
+    pass
+else:
+    assert False
+
+
++ MQTT 5.0 length-prefixed fields
+
+= MQTTStringField round trip
+string_field = MQTTStringField("s", b"")
+encoded = string_field.addfield(None, b"", b"hello")
+assert encoded == b"\x00\x05hello"
+remain, decoded = string_field.getfield(None, encoded + b"tail")
+assert decoded == b"hello"
+assert remain == b"tail"
+
+= MQTTBinaryField round trip
+binary_field = MQTTBinaryField("b", b"")
+encoded = binary_field.addfield(None, b"", b"\x00\x01\xfe")
+assert encoded == b"\x00\x03\x00\x01\xfe"
+remain, decoded = binary_field.getfield(None, encoded)
+assert decoded == b"\x00\x01\xfe"
+assert remain == b""
+
+= MQTTStringPairField round trip
+pair_field = MQTTStringPairField("p", (b"", b""))
+encoded = pair_field.addfield(None, b"", (b"name", b"value"))
+assert encoded == b"\x00\x04name\x00\x05value"
+remain, decoded = pair_field.getfield(None, encoded)
+assert decoded == (b"name", b"value")
+assert remain == b""
+
+
++ MQTT 5.0 properties
+
+= MQTTProperty value kind selection
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_PAYLOAD_FORMAT_INDICATOR),
+    ByteField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_RECEIVE_MAXIMUM),
+    ShortField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_SESSION_EXPIRY_INTERVAL),
+    IntField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_MAXIMUM_PACKET_SIZE),
+    LongField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_SUBSCRIPTION_IDENTIFIER),
+    VarIntField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_CORRELATION_DATA),
+    MQTTBinaryField
+)
+assert isinstance(
+    mqtt_property_value_field(MQTT_PROP_USER_PROPERTY),
+    MQTTStringPairField
+)
+
+= MQTTProperty build and dissect
+prop = MQTTProperty(prop=MQTT_PROP_RECEIVE_MAXIMUM, value=10)
+assert raw(prop) == b"\x21\x00\x0a"
+decoded = MQTTProperty(raw(prop))
+assert decoded.prop == MQTT_PROP_RECEIVE_MAXIMUM
+assert decoded.value == 10
+
+= MQTTPropertiesField build and dissect
+properties = [
+    MQTTProperty(prop=MQTT_PROP_SESSION_EXPIRY_INTERVAL, value=3600),
+    MQTTProperty(prop=MQTT_PROP_RECEIVE_MAXIMUM, value=10),
+    MQTTProperty(prop=MQTT_PROP_USER_PROPERTY,
+                 value=(b"role", b"sensor")),
+]
+field = MQTTPropertiesField("properties", [])
+encoded = field.addfield(None, b"", properties)
+remain, decoded = field.getfield(None, encoded)
+assert remain == b""
+assert [prop.prop for prop in decoded] == [
+    MQTT_PROP_SESSION_EXPIRY_INTERVAL,
+    MQTT_PROP_RECEIVE_MAXIMUM,
+    MQTT_PROP_USER_PROPERTY,
+]
+assert decoded[0].value == 3600
+assert decoded[1].value == 10
+assert decoded[2].value == (b"role", b"sensor")
+assert field.addfield(None, b"", decoded) == encoded
+
+= MQTTPropertiesField rejects truncated data
+try:
+    MQTTPropertiesField("p", []).getfield(None, b"\x05\x11\x00")
+except Scapy_Exception:
+    pass
+else:
+    assert False
+
+
++ MQTT 5.0 CONNECT
+
+= MQTTConnect 5.0 build and dissect with properties
+connect = MQTT() / MQTTConnect(
+    protoname="MQTT",
+    protolevel=5,
+    cleansess=1,
+    klive=60,
+    clientId="scapy",
+    properties=[
+        MQTTProperty(prop=MQTT_PROP_SESSION_EXPIRY_INTERVAL, value=3600),
+        MQTTProperty(prop=MQTT_PROP_RECEIVE_MAXIMUM, value=10),
+        MQTTProperty(prop=MQTT_PROP_USER_PROPERTY,
+                     value=(b"role", b"sensor")),
+    ],
+)
+decoded = MQTT(raw(connect))
+assert decoded.protolevel == 5
+assert decoded.clientId == b"scapy"
+assert len(decoded.properties) == 3
+assert decoded.properties[0].prop == MQTT_PROP_SESSION_EXPIRY_INTERVAL
+assert decoded.properties[0].value == 3600
+assert decoded.properties[1].value == 10
+assert decoded.properties[2].value == (b"role", b"sensor")
+assert raw(decoded) == raw(connect)
+
+= MQTTConnect 5.0 with empty properties
+connect = MQTT() / MQTTConnect(
+    protoname="MQTT", protolevel=5, clientId="",
+)
+decoded = MQTT(raw(connect))
+assert decoded.properties == []
+assert raw(decoded) == raw(connect)
+
+= MQTTConnect 5.0 with will properties and credentials
+connect = MQTT() / MQTTConnect(
+    protoname="MQTT",
+    protolevel=5,
+    willflag=1,
+    willQOSflag=1,
+    cleansess=1,
+    clientId="scapy",
+    properties=[
+        MQTTProperty(prop=MQTT_PROP_SESSION_EXPIRY_INTERVAL, value=60),
+    ],
+    willproperties=[
+        MQTTProperty(prop=MQTT_PROP_WILL_DELAY_INTERVAL, value=5),
+    ],
+    willtopic="last/will",
+    willmsg=b"bye",
+    usernameflag=1,
+    username="user",
+    passwordflag=1,
+    password=b"secret",
+)
+decoded = MQTT(raw(connect))
+assert decoded.willproperties[0].prop == MQTT_PROP_WILL_DELAY_INTERVAL
+assert decoded.willproperties[0].value == 5
+assert decoded.willtopic == b"last/will"
+assert decoded.willmsg == b"bye"
+assert decoded.username == b"user"
+assert decoded.password == b"secret"
+assert raw(decoded) == raw(connect)
+
+
++ MQTT 5.0 CONNACK
+
+= MQTTConnack 5.0 build and dissect with properties
+connack = MQTT() / MQTTConnack(
+    sessPresentFlag=0,
+    retcode=0,
+    properties=[
+        MQTTProperty(prop=MQTT_PROP_RECEIVE_MAXIMUM, value=20),
+        MQTTProperty(prop=MQTT_PROP_ASSIGNED_CLIENT_IDENTIFIER,
+                     value=b"scapy"),
+    ],
+)
+decoded = MQTT(raw(connack))
+assert decoded.retcode == 0
+assert decoded.properties[0].prop == MQTT_PROP_RECEIVE_MAXIMUM
+assert decoded.properties[0].value == 20
+assert decoded.properties[1].value == b"scapy"
+assert raw(decoded) == raw(connack)
+
+= MQTTConnack 5.0 with empty properties
+decoded = MQTT(b" \x03\x00\x00\x00")
+assert decoded.retcode == 0
+assert decoded.properties == []
+assert raw(decoded) == b" \x03\x00\x00\x00"
+
+
++ MQTT 5.0 PUBLISH
+
+= MQTTPublish 5.0 QoS 0 build and dissect with properties
+stream = (
+    MQTT() / MQTTConnect(protolevel=5, clientId="")
+    / MQTT(QOS=0) / MQTTPublish(
+        topic="sensors/temp",
+        value=b'{"temp":21.5}',
+        properties=[
+            MQTTProperty(prop=MQTT_PROP_CONTENT_TYPE,
+                         value=b"application/json"),
+            MQTTProperty(prop=MQTT_PROP_USER_PROPERTY,
+                         value=(b"unit", b"celsius")),
+        ],
+    )
+)
+decoded = MQTT(raw(stream))
+publish = decoded[MQTTPublish]
+assert publish.topic == b"sensors/temp"
+assert publish.value == b'{"temp":21.5}'
+assert publish.properties[0].prop == MQTT_PROP_CONTENT_TYPE
+assert publish.properties[0].value == b"application/json"
+assert publish.properties[1].value == (b"unit", b"celsius")
+assert raw(decoded) == raw(stream)
+
+= MQTTPublish 5.0 QoS 1 build and dissect with message identifier
+stream = (
+    MQTT() / MQTTConnect(protolevel=5, clientId="")
+    / MQTT(QOS=1) / MQTTPublish(
+        topic="t",
+        msgid=7,
+        value=b"pay",
+        properties=[
+            MQTTProperty(prop=MQTT_PROP_MESSAGE_EXPIRY_INTERVAL, value=30),
+        ],
+    )
+)
+decoded = MQTT(raw(stream))
+publish = decoded[MQTTPublish]
+assert publish.msgid == 7
+assert publish.value == b"pay"
+assert publish.properties[0].value == 30
+assert raw(decoded) == raw(stream)
+
+= MQTTPublish 5.0 with binary and variable byte integer properties
+stream = (
+    MQTT() / MQTTConnect(protolevel=5, clientId="")
+    / MQTT() / MQTTPublish(
+        topic="t",
+        value=b"v",
+        properties=[
+            MQTTProperty(prop=MQTT_PROP_CORRELATION_DATA,
+                         value=b"\x00\x01\xfe"),
+            MQTTProperty(prop=MQTT_PROP_SUBSCRIPTION_IDENTIFIER,
+                         value=300),
+        ],
+    )
+)
+decoded = MQTT(raw(stream))
+publish = decoded[MQTTPublish]
+assert publish.properties[0].value == b"\x00\x01\xfe"
+assert publish.properties[1].value == 300
+assert raw(decoded) == raw(stream)
+
+
++ MQTT 3.1.1 compatibility
+
+= MQTTConnect 3.1.1 has no properties field
+connect = MQTT(b"\x10\x1f\x00\x06MQIsdp\x03\x02\x00<"
+               b"\x00\x11mosqpub/1440-kali")
+assert connect.protolevel == 3
+assert connect.clientId == b"mosqpub/1440-kali"
+assert "properties" not in connect.fields
+
+= MQTTConnect 3.1.1 build stays unchanged
+connect = MQTT() / MQTTConnect(
+    protoname="MQTT", protolevel=4, cleansess=1, klive=60,
+    clientId="scapy-legacy",
+)
+decoded = MQTT(raw(connect))
+assert decoded.protolevel == 4
+assert "properties" not in decoded.fields
+assert raw(decoded) == raw(connect)
+
+= MQTTConnack 3.1.1 stays a two byte packet
+connack = MQTT(b" \x02\x00\x00")
+assert type(connack.payload) is MQTTConnack
+assert connack.retcode == 0
+assert "properties" not in connack[MQTTConnack].fields
+assert raw(connack) == b" \x02\x00\x00"
+
+= MQTTPublish 3.1.1 stays unchanged
+publish = MQTT(b"0\n\x00\x04testtest")
+assert publish.topic == b"test"
+assert publish.value == b"test"
+assert "properties" not in publish[MQTTPublish].fields
+assert raw(publish) == b"0\n\x00\x04testtest"
+
+
++ MQTT 5.0 pcap regression
+
+= Dissect MQTT 5.0 and 3.1.1 packets from a pcap
+pcap = rdpcap(scapy_path("/test/pcaps/mqtt5.pcap.gz"))
+assert len(pcap) == 6
+connect = pcap[0][MQTTConnect]
+assert connect.protolevel == 5
+assert connect.properties[0].prop == MQTT_PROP_SESSION_EXPIRY_INTERVAL
+assert connect.properties[0].value == 3600
+assert connect.properties[3].value == (b"role", b"sensor")
+connack = pcap[1][MQTTConnack]
+assert connack.properties[0].value == 20
+assert connack.properties[1].value == b"scapy"
+stream = pcap[2]
+publish = stream[MQTTPublish]
+assert publish.topic == b"sensors/temp"
+assert publish.value == b'{"temp":21.5}'
+assert publish.properties[0].value == b"application/json"
+legacy_connect = pcap[3][MQTTConnect]
+assert legacy_connect.protolevel == 4
+assert "properties" not in legacy_connect.fields
+legacy_publish = pcap[5][MQTTPublish]
+assert legacy_publish.topic == b"legacy/topic"
+assert legacy_publish.value == b"hello"
+assert "properties" not in legacy_publish.fields
