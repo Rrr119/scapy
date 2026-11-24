@@ -115,3 +115,75 @@ try:
     assert False, "QUIC Variable length should fail"
 except struct.error:
     pass
+
+= QUIC - RFC 9001 Initial keys
+
+from scapy.layers.quic import quic_initial_crypto
+
+dcid = bytes.fromhex("8394c8f03e515708")
+client, server = quic_initial_crypto(1, dcid)
+assert client.key == bytes.fromhex("1f369613dd76d5467730efcbe3b1a22d")
+assert client.iv == bytes.fromhex("fa044b2f42a3fd3b46fb255c")
+assert client.hp == bytes.fromhex("9f50449e04a0e810283a1e9933adedd2")
+assert server.key == bytes.fromhex("cf3a5331653c364c88f0f379b6067e37")
+assert server.iv == bytes.fromhex("0ac1493ca1905853b0bba03e")
+assert server.hp == bytes.fromhex("c206b8d9b9f0f37644430b490eeaa314")
+
+= QUIC - STREAM frame build and parse
+
+from scapy.layers.quic import QUIC_Frames, QUIC_STREAM
+
+pkt = QUIC_Frames(frames=[QUIC_STREAM(StreamID=0, Data=b"abc")])
+assert bytes(pkt) == b"\x08\x00abc"
+decoded = QUIC_Frames(bytes(pkt))
+assert len(decoded.frames) == 1
+assert isinstance(decoded.frames[0], QUIC_STREAM)
+assert decoded.frames[0].StreamID == 0
+assert decoded.frames[0].Data == b"abc"
+
+= QUIC - multiple frames in one packet
+
+from scapy.layers.quic import QUIC_Frames, QUIC_PING, QUIC_STREAM
+
+pkt = QUIC_Frames(
+    frames=[
+        QUIC_PING(),
+        QUIC_STREAM(StreamID=4, Data=b"hello"),
+    ]
+)
+decoded = QUIC_Frames(bytes(pkt))
+assert [type(frame) for frame in decoded.frames] == [
+    QUIC_PING,
+    QUIC_STREAM,
+]
+assert decoded.frames[1].StreamID == 4
+assert decoded.frames[1].Data == b"hello"
+
+= QUIC - build a protected Initial packet and dissect it back
+
+from scapy.layers.quic import (
+    QUIC,
+    QUIC_Frames,
+    QUIC_Initial,
+    QUIC_PING,
+    QUICConnectionState,
+)
+
+pkt = QUIC_Initial(
+    DstConnID=b"12345678",
+    SrcConnID=b"abcdefgh",
+    PacketNumber=0,
+) / QUIC_Frames(frames=[QUIC_PING()])
+wire = bytes(pkt)
+assert len(wire) >= 45
+
+state = QUICConnectionState(
+    (("127.0.0.1", 1), ("127.0.0.1", 2)),
+    ("127.0.0.1", 1),
+)
+decoded = QUIC(wire, quic_session=state)
+assert decoded._quic_plaintext_valid
+assert any(
+    isinstance(frame, QUIC_PING)
+    for frame in decoded[QUIC_Frames].frames
+)

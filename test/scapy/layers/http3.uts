@@ -1,0 +1,239 @@
+% HTTP/3 and QPACK regression tests
+% Field expectations below were cross-checked with Wireshark 4.6.4 (tshark).
+
++ QPACK vectors
+
+= QPACK - literal field line with static name reference (RFC 9204 B.1)
+
+from scapy.layers.http3 import QPACKDecoder
+
+block = bytes.fromhex("0000510b2f696e6465782e68746d6c")
+assert QPACKDecoder().decode_header_block(block) == [
+    (b":path", b"/index.html"),
+]
+
+= QPACK - dynamic table and post-base indexes (RFC 9204 B.2)
+
+from scapy.layers.http3 import (
+    QPACKDecoder,
+    qpack_decode_encoder_instructions,
+)
+
+decoder = QPACKDecoder(max_table_capacity=4096)
+instructions, consumed = qpack_decode_encoder_instructions(
+    bytes.fromhex(
+        "3fbd01c00f7777772e6578616d706c652e636f6d"
+        "c10c2f73616d706c652f70617468"
+    ),
+    decoder,
+)
+assert consumed == 34
+assert instructions == [
+    ("capacity", 220),
+    ("insert", b":authority", b"www.example.com"),
+    ("insert", b":path", b"/sample/path"),
+]
+assert decoder.decode_header_block(bytes.fromhex("03811011")) == [
+    (b":authority", b"www.example.com"),
+    (b":path", b"/sample/path"),
+]
+
+= QPACK - Huffman strings
+
+from scapy.layers.http3 import qpack_huffman_decode, qpack_huffman_encode
+
+encoded = bytes.fromhex("f1e3c2e5f23a6ba0ab90f4ff")
+assert qpack_huffman_decode(encoded) == b"www.example.com"
+assert qpack_huffman_encode(b"www.example.com") == encoded
+
+= QPACK - duplicate instruction and dynamic indexed lines (RFC 9204 B.4)
+
+from scapy.layers.http3 import (
+    QPACKDecoder,
+    qpack_decode_encoder_instructions,
+)
+
+decoder = QPACKDecoder(max_table_capacity=4096)
+decoder.set_capacity(220)
+decoder.insert(b":authority", b"www.example.com")
+decoder.insert(b":path", b"/sample/path")
+decoder.insert(b"custom-key", b"custom-value")
+qpack_decode_encoder_instructions(bytes.fromhex("02"), decoder)
+assert decoder.decode_header_block(bytes.fromhex("050080c181")) == [
+    (b":authority", b"www.example.com"),
+    (b":path", b"/"),
+    (b"custom-key", b"custom-value"),
+]
+
++ HTTP/3 frames
+
+= HTTP/3 - build DATA frame
+
+load_layer("http3")
+
+pkt = HTTP3(frames=[H3DataFrame(Data=b"abc")])
+assert bytes(pkt) == b"\x00\x03abc"
+
+= HTTP/3 - build and parse HEADERS frame
+
+load_layer("http3")
+
+block = bytes.fromhex("0000510b2f696e6465782e68746d6c")
+pkt = HTTP3(frames=[H3HeadersFrame(Data=block)])
+assert bytes(pkt) == b"\x01" + bytes([len(block)]) + block
+decoded = HTTP3(bytes(pkt))
+assert isinstance(decoded.frames[0], H3HeadersFrame)
+assert decoded.frames[0].Data == block
+
+= HTTP/3 - SETTINGS frame
+
+load_layer("http3")
+
+pkt = HTTP3(bytes.fromhex("040401000700"))
+assert isinstance(pkt.frames[0], H3SettingsFrame)
+assert pkt.frames[0].settings == {0x01: 0, 0x07: 0}
+
++ HTTP/3 over QUIC PCAPs
+
+= HTTP/3 pcap - request, response and QPACK static headers
+~ http3
+
+import os
+from scapy.config import conf
+from scapy.layers.quic import QUIC, quic_reset_sessions
+from scapy.layers.http3 import HTTP3, H3DataFrame, H3HeadersFrame
+
+old_filename = conf.tls_nss_filename
+old_keys = conf.tls_nss_keys
+try:
+    quic_reset_sessions()
+    conf.tls_nss_filename = scapy_path("/test/pcaps/http3_get.keys")
+    conf.tls_nss_keys = None
+    packets = sniff(
+        offline=scapy_path("/test/pcaps/http3_get.pcap"),
+    )
+    assert QUIC in packets[0]
+    assert packets[0][QUIC]._quic_plaintext_valid
+    headers = [
+        frame
+        for packet in packets
+        if HTTP3 in packet
+        for frame in packet[HTTP3].frames
+        if isinstance(frame, H3HeadersFrame)
+    ]
+    assert headers[0].header_dict[b":method"] == [b"GET"]
+    assert headers[0].header_dict[b":path"] == [b"/hello"]
+    assert headers[0].header_dict[b"user-agent"] == [b"scapy-http3-test"]
+    assert headers[1].header_dict[b":status"] == [b"200"]
+    data = [
+        frame.Data
+        for packet in packets
+        if HTTP3 in packet
+        for frame in packet[HTTP3].frames
+        if isinstance(frame, H3DataFrame)
+    ]
+    assert data == [b"hello http3"]
+finally:
+    conf.tls_nss_filename = old_filename
+    conf.tls_nss_keys = old_keys
+    quic_reset_sessions()
+
+= HTTP/3 pcap - fragmented request and response DATA
+~ http3
+
+from scapy.config import conf
+from scapy.layers.quic import QUICSession, quic_reset_sessions
+from scapy.layers.http3 import HTTP3, H3DataFrame, H3HeadersFrame
+
+old_filename = conf.tls_nss_filename
+old_keys = conf.tls_nss_keys
+try:
+    quic_reset_sessions()
+    conf.tls_nss_filename = scapy_path("/test/pcaps/http3_post.keys")
+    conf.tls_nss_keys = None
+    packets = sniff(
+        offline=scapy_path("/test/pcaps/http3_post.pcap"),
+        session=QUICSession,
+    )
+    headers = [
+        frame
+        for packet in packets
+        if HTTP3 in packet
+        for frame in packet[HTTP3].frames
+        if isinstance(frame, H3HeadersFrame)
+    ]
+    assert headers[0].header_dict[b":method"] == [b"POST"]
+    assert headers[0].header_dict[b":path"] == [b"/submit"]
+    assert headers[1].header_dict[b":status"] == [b"200"]
+    request_data = []
+    response_data = []
+    for packet in packets:
+        if HTTP3 not in packet:
+            continue
+        is_request = (
+            packet[IP].src == "127.0.0.1"
+            and packet[UDP].sport == 50000
+        )
+        target = request_data if is_request else response_data
+        target.extend(
+            frame.Data
+            for frame in packet[HTTP3].frames
+            if isinstance(frame, H3DataFrame)
+        )
+    assert len(request_data) == 2
+    assert b"".join(request_data) == b"A" * 6000
+    assert b"".join(response_data) == b"hello http3" + b"!" * 6000
+finally:
+    conf.tls_nss_filename = old_filename
+    conf.tls_nss_keys = old_keys
+    quic_reset_sessions()
+
+= HTTP/3 pcap - multiple requests and dynamic QPACK table
+~ http3
+
+from scapy.config import conf
+from scapy.layers.quic import QUICSession, quic_reset_sessions
+from scapy.layers.http3 import (
+    HTTP3,
+    HTTP3_QPACK_ENCODER,
+    HTTP3Stream,
+    H3HeadersFrame,
+)
+
+old_filename = conf.tls_nss_filename
+old_keys = conf.tls_nss_keys
+try:
+    quic_reset_sessions()
+    conf.tls_nss_filename = scapy_path("/test/pcaps/http3_multi.keys")
+    conf.tls_nss_keys = None
+    packets = sniff(
+        offline=scapy_path("/test/pcaps/http3_multi.pcap"),
+        session=QUICSession,
+    )
+    paths = [
+        frame.header_dict[b":path"][0]
+        for packet in packets
+        if HTTP3 in packet
+        for frame in packet[HTTP3].frames
+        if isinstance(frame, H3HeadersFrame) and b":path" in frame.header_dict
+    ]
+    assert paths == [b"/one", b"/two"]
+    qpack_streams = [
+        packet[HTTP3Stream]
+        for packet in packets
+        if HTTP3Stream in packet
+        and packet[HTTP3Stream].stream_type == HTTP3_QPACK_ENCODER
+    ]
+    inserted = [
+        instruction
+        for stream in qpack_streams
+        for instruction in stream.instructions
+        if instruction[0] == "insert"
+    ]
+    assert (b":authority", b"localhost") in [
+        instruction[1:] for instruction in inserted
+    ]
+finally:
+    conf.tls_nss_filename = old_filename
+    conf.tls_nss_keys = old_keys
+    quic_reset_sessions()
